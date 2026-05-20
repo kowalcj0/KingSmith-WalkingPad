@@ -27,6 +27,7 @@ from .const import (
     SPEED_MIN,
     SPEED_MAX,
     CMD_MC21_START,
+    CMD_MC21_PAUSE,
     CMD_MC21_STOP,
     UUID_MC21_AUTH,
     CMD_MC21_AUTH,
@@ -151,15 +152,27 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Failed to connect to device: %s", exc)
             raise
 
-        try:
-            await self.client.start_notify(self.uuids["data"], self._notification_handler)
-            await self.client.start_notify(self.uuids["control"], self.handle_response)
-            await self.client.start_notify(self.uuids["status"], self._training_status_handler)
-            _LOGGER.info("Subscribed to notifications")
-        except Exception as exc:
-            _LOGGER.error("Failed to subscribe to notifications: %s", exc)
+        # Subscribe with staggered delays — KingSmith firmware silently drops
+        # CCCD writes that arrive within ~30ms of each other.
+        # KS Fit staggers 100/200/300ms between subscriptions; we mirror this.
+        # Reference: walkingpad-controller docs/ftms-protocol-reference.md §2.2
+        subscriptions = [
+            (self.uuids["data"],    self._notification_handler,      "Treadmill Data",    0.10),
+            (self.uuids["status"],  self._training_status_handler,   "Machine Status",    0.20),
+            (self.uuids["control"], self.handle_response,            "Control Point",     0.0),
+        ]
+        for uuid, handler, label, delay in subscriptions:
+            try:
+                await self.client.start_notify(uuid, handler)
+                _LOGGER.debug("Subscribed to %s", label)
+            except Exception as exc:
+                _LOGGER.error("Failed to subscribe to %s: %s", label, exc)
+            if delay:
+                await asyncio.sleep(delay)
+        _LOGGER.info("Subscribed to all notifications")
 
-        # MC21: send proprietary authorization token to unlock 2AD9 control
+        # MC21: send initial ODM pre-amble once at connect (mirrors KS Fit behaviour)
+        # This is also sent before each command in send_start/pause/finish/set_speed
         if self.is_mc21:
             await self.send_mc21_auth()
 
@@ -230,9 +243,15 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
 
     # Control commands (no changes, just cleaned logs)
     async def send_mc21_auth(self) -> None:
-        """Send the proprietary KingSmith authorization token to unlock 2AD9 control on MC21.
-        Must be called once after connecting, before any Start/Stop/Speed commands.
-        Confirmed from HCI snoop log — static 8-byte token, identical across all sessions.
+        """Send the KingSmith ODM pre-amble before every Control Point command on MC21.
+
+        KS Fit sends this before EACH command (start/stop/pause/speed), not just
+        once at connect time. Without it, the MC21 returns CONTROL_NOT_PERMITTED.
+        The payload is a static ODMSupplement.propertyList() frame — a device
+        handshake/unlock sequence. Confirmed from HCI snoop: 41 identical writes
+        in one session, one per Control Point operation.
+
+        Reference: walkingpad-controller docs/ftms-protocol-reference.md §2.4
         """
         if not self.is_mc21 or not self.is_connected:
             return
@@ -242,35 +261,44 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
                 CMD_MC21_AUTH,
                 response=True,
             )
-            _LOGGER.info("MC21 authorization token sent successfully")
+            _LOGGER.debug("MC21 ODM pre-amble sent")
         except Exception as exc:
-            _LOGGER.error("Failed to send MC21 authorization token: %s", exc)
+            _LOGGER.warning("Failed to send MC21 ODM pre-amble: %s", exc)
 
     async def send_control_request(self):
-        """MC11 only — MC21 does not need this before any command."""
-        if self.is_mc21:
-            return
-        if self.is_connected:
-            try:
-                # await self.client.write_gatt_char(UUID_CONTROL_POINT, CMD_CONTROL_REQUEST, response=True)
-                await self.client.write_gatt_char(
-                    self.uuids["control"],
-                    CMD_CONTROL_REQUEST,
-                    response=True
-                )
-            except Exception as e:
-                _LOGGER.debug("Error sending CONTROL REQUEST: %s", e)
-        else:
+        """Send FTMS Request Control (0x00).
+
+        MC11: required before every command — device grants control.
+        MC21: always rejected (OPERATION_FAILED) but KS Fit sends it anyway
+              and proceeds regardless. We mirror this behaviour.
+        """
+        if not self.is_connected:
             _LOGGER.debug("Cannot send CONTROL REQUEST, client not connected")
+            return
+        try:
+            # await self.client.write_gatt_char(UUID_CONTROL_POINT, CMD_CONTROL_REQUEST, response=True)
+            await self.client.write_gatt_char(
+                self.uuids["control"],
+                CMD_CONTROL_REQUEST,
+                response=True
+            )
+        except Exception as e:
+            # MC21 always rejects this — log at debug not warning
+            _LOGGER.debug("CONTROL REQUEST response: %s (MC21 rejection is normal)", e)
 
     async def send_start(self):
-        """Start the treadmill. MC21: [0x07] direct. MC11: Request Control + [0x07,0x01]."""
+        """Start the treadmill.
+        MC21: ODM preamble → Request Control (tolerate rejection) → START_OR_RESUME [0x07]
+        MC11: Request Control → START_OR_RESUME [0x07, 0x01]
+        """
         if not self.is_connected:
             _LOGGER.debug("Cannot send START, client not connected")
             return
+        # MC21: send ODM preamble before each command (KS Fit does this every time)
+        if self.is_mc21:
+            await self.send_mc21_auth()
+        await self.send_control_request()  # MC21 will reject this, that's expected
         cmd = CMD_MC21_START if self.is_mc21 else CMD_START
-        if not self.is_mc21:
-            await self.send_control_request()
         try:
             await self.client.write_gatt_char(self.uuids["control"], cmd, response=True)
             _LOGGER.info("Start command sent")
@@ -278,27 +306,35 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Error sending START: %s", e)
 
     async def send_pause(self):
-        """Pause the treadmill. MC21: [0x08] direct. MC11: Request Control + [0x08,0x02]."""
+        """Pause the treadmill.
+        MC21: ODM preamble → Request Control (tolerate rejection) → STOP_OR_PAUSE [0x08, 0x02]
+        MC11: Request Control → STOP_OR_PAUSE [0x08, 0x02]
+        """
         if not self.is_connected:
-            _LOGGER.debug("Cannot send STOP, client not connected")
+            _LOGGER.debug("Cannot send PAUSE, client not connected")
             return
-        cmd = CMD_MC21_STOP if self.is_mc21 else CMD_STOP
-        if not self.is_mc21:
-            await self.send_control_request()
+        if self.is_mc21:
+            await self.send_mc21_auth()
+        await self.send_control_request()
+        cmd = CMD_MC21_PAUSE if self.is_mc21 else CMD_STOP
         try:
             await self.client.write_gatt_char(self.uuids["control"], cmd, response=True)
             _LOGGER.info("Pause command sent")
         except Exception as e:
-            _LOGGER.debug("Error sending STOP: %s", e)
+            _LOGGER.debug("Error sending PAUSE: %s", e)
 
     async def send_finish(self):
-        """Stop the treadmill. MC21: [0x08] direct. MC11: Request Control + [0x08,0x01]."""
+        """Stop the treadmill completely.
+        MC21: ODM preamble → Request Control (tolerate rejection) → STOP_OR_PAUSE [0x08, 0x01]
+        MC11: Request Control → STOP_OR_PAUSE [0x08, 0x01]
+        """
         if not self.is_connected:
             _LOGGER.debug("Cannot send FINISH, client not connected")
             return
+        if self.is_mc21:
+            await self.send_mc21_auth()
+        await self.send_control_request()
         cmd = CMD_MC21_STOP if self.is_mc21 else CMD_FINISH
-        if not self.is_mc21:
-            await self.send_control_request()
         try:
             await self.client.write_gatt_char(self.uuids["control"], cmd, response=True)
             _LOGGER.info("Finish command sent")
@@ -318,8 +354,10 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             return
         # Clamp and round to 0.1 resolution
         kmh = round(max(self.speed_min, min(self.speed_max, kmh)), 1)
-        if not self.is_mc21:
-            await self.send_control_request()
+        # MC21: send ODM preamble before speed command (same as start/stop)
+        if self.is_mc21:
+            await self.send_mc21_auth()
+        await self.send_control_request()  # MC21 tolerates rejection
         try:
             await self.client.write_gatt_char(
                 self.uuids["control"],

@@ -58,13 +58,18 @@ CMD_START  = bytes([0x07, 0x01])   # MC11: Start with parameter
 CMD_STOP   = bytes([0x08, 0x02])   # MC11: Stop with Pause parameter
 CMD_FINISH = bytes([0x08, 0x01])   # MC11: Stop with Stop parameter
 
-# MC21 commands — NO Request Control needed, bare opcodes only
-CMD_MC21_START  = bytes([0x07])    # Confirmed from nRF log 18:36:23
-CMD_MC21_STOP   = bytes([0x08])    # Confirmed from nRF log 18:37:22
+# MC21 commands — No Request Control needed before preamble+command
+# But FTMS parameters are still required (same opcodes as MC11)
+CMD_MC21_START  = bytes([0x07])         # Start/Resume — no parameter per FTMS spec
+CMD_MC21_PAUSE  = bytes([0x08, 0x02])   # Stop or Pause with PAUSE param — confirmed FTMS
+CMD_MC21_STOP   = bytes([0x08, 0x01])   # Stop or Pause with STOP param — confirmed FTMS
 
-# MC21 proprietary authorization UUID and token
-# The KS Fit app writes this static token to unlock 2AD9 control after connecting
-# Confirmed from HCI snoop log — identical across 41 sessions
+# MC21 proprietary ODM pre-amble UUID and payload
+# KS Fit writes this before EVERY Control Point command, not just once at connect.
+# This is an ODMSupplement.propertyList() frame — a "device unlock" / handshake.
+# Without it before each command, the MC21 returns CONTROL_NOT_PERMITTED.
+# Confirmed from HCI snoop log: 41 identical writes across one session.
+# Reference: walkingpad-controller docs/ftms-protocol-reference.md §2.4
 UUID_MC21_AUTH = "d18d2c10-c44c-11e8-a355-529269fb1459"
 CMD_MC21_AUTH  = bytes([0x01, 0x00, 0x0D, 0x00, 0x06, 0x0B, 0x0F, 0x0D])
 

@@ -12,16 +12,20 @@ _LOGGER = logging.getLogger(__name__)
 # _LOGGER.debug(f"EntitySelector __init__ signature: {inspect.signature(selector.EntitySelector.__init__)}")
 
 SUPPORTED_NAME_PREFIXES = (
-    "KS-AP",     # MC11
-    "KS-C2",     # C2
-    "KS-MC21",   # MC21
-    "KS-",       # future KingSmith models
+    "KS-AP",       # MC11
+    "KS-C2",       # C2
+    "KS-MC21",     # MC21
+    "KS-SMC21C",   # MC21 C-variant
+    "ZP-ZEALR1",   # Zeal-branded MC21 OEM variant
+    "KS-HD-",      # Modern KS-HD FTMS models (e.g. KS-HD-Z1D)
+    "KS-",         # future KingSmith models
     "WalkingPad"
 )
 
 def normalize_model(ble_name: str) -> str:
     """Normalize BLE name into a stable WalkingPad model string.
     Order matters — more specific prefixes must come before generic ones.
+    Prefix list sourced from KS Fit isMC21 getter (reverse-engineered).
     """
     if not ble_name:
         return "WalkingPad"
@@ -30,8 +34,11 @@ def normalize_model(ble_name: str) -> str:
         return "WalkingPad C2"
     if ble_name.startswith("KS-AP"):
         return "WalkingPad MC11"
-    if ble_name.startswith("KS-MC21"):
+    # All MC21 variants — KS Fit's isMC21 getter matches all three prefixes
+    if ble_name.startswith(("KS-MC21", "KS-SMC21C", "ZP-ZEALR1")):
         return "WalkingPad MC21"
+    if ble_name.startswith("KS-HD-"):
+        return "WalkingPad"  # FTMS model, treated as generic for now
     if ble_name.startswith("KS-"):
         return "WalkingPad"
 
