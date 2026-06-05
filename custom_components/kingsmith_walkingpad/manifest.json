@@ -2,8 +2,8 @@
   "domain": "kingsmith_walkingpad",
   "name": "KingSmith WalkingPad",
   "config_flow": true,
-  "documentation": "https://github.com/UrbanTechIO/kingsmith_walkingpad",
-  "issue_tracker": "https://github.com/UrbanTechIO/kingsmith_walkingpad/issues",
+  "documentation": "https://github.com/UrbanTechIO/KingSmith-WalkingPad",
+  "issue_tracker": "https://github.com/UrbanTechIO/KingSmith-WalkingPad/issues",
   "requirements": [
     "bleak>=0.21.0",
     "bleak-retry-connector>=3.0.0"
