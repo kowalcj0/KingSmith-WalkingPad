@@ -34,6 +34,16 @@ from .const import (
     P1_FRAME_SYNC,
     P1_PKT_TYPE_DATA,
     P1_PKT_SIZE,
+    P1_END_MARKER,
+    P1_CMD_SYNC,
+    P1_CMD_TYPE,
+    P1_CMD_QUERY,
+    P1_CMD_SPEED,
+    P1_CMD_MODE,
+    P1_CMD_START,
+    P1_STATE_IDLE,
+    P1_STATE_RUNNING,
+    P1_STATE_TRANSITION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -62,6 +72,7 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
 
         self.client = None
         self._retry_task = None
+        self._p1_poll_task = None
         self.data = {
             "speed": 0.0,
             "distance": 0,
@@ -168,20 +179,22 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         # KS Fit staggers 100/200/300ms between subscriptions; we mirror this.
         # Reference: walkingpad-controller docs/ftms-protocol-reference.md §2.2
         #
-        # For P1: data on 0000fe01 (N+R), control on 0000fe02 (W+N+R)
+        # For P1: data notifications arrive on 0000fe01 only.
+        # 0000fe02 (control) has no CCCD, so subscribing to it fails.
         if self.is_p1:
-            subscriptions = [
-                (self.uuids["data"],    self._notification_handler,      "P1 Data",         0.10),
-                (self.uuids["control"], self.handle_response,            "P1 Control",      0.20),
-            ]
-            for uuid, handler, label, delay in subscriptions:
-                try:
-                    await self.client.start_notify(uuid, handler)
-                    _LOGGER.debug("Subscribed to %s", label)
-                except Exception as exc:
-                    _LOGGER.error("Failed to subscribe to %s: %s", label, exc)
-                if delay:
-                    await asyncio.sleep(delay)
+            # Only subscribe to data characteristic (0000fe01)
+            try:
+                await self.client.start_notify(
+                    self.uuids["data"], self._notification_handler
+                )
+                _LOGGER.debug("Subscribed to P1 Data (0000fe01)")
+            except Exception as exc:
+                _LOGGER.error("Failed to subscribe to P1 Data: %s", exc)
+
+            # Start periodic status polling for P1 (belt only sends data
+            # when polled via query command)
+            self._p1_poll_task = asyncio.ensure_future(self._p1_poll_loop())
+
             _LOGGER.info("Subscribed to P1 notifications")
         else:
             subscriptions = [
@@ -204,17 +217,16 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         if self.is_mc21:
             await self.send_mc21_auth()
 
-    # async def async_stop(self):
-    #     """Disconnect BLE client."""
-    #     await self.disconnect()
     async def async_stop(self):
-        """Disconnect BLE client and cancel retry loop."""
+        """Disconnect BLE client and cancel retry/poll loops."""
+        await self._cancel_p1_poll()
         if self._retry_task and not self._retry_task.done():
             self._retry_task.cancel()
             self._retry_task = None
         await self.disconnect()
 
     async def disconnect(self):
+        await self._cancel_p1_poll()
         if self.client and self.client.is_connected:
             try:
                 await self.client.disconnect()
@@ -222,10 +234,17 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             except Exception as exc:
                 _LOGGER.debug("Error during disconnect: %s", exc)
         self.client = None
+
+    async def _cancel_p1_poll(self):
+        """Cancel the P1 periodic poll task if running."""
+        if self._p1_poll_task and not self._p1_poll_task.done():
+            self._p1_poll_task.cancel()
+            self._p1_poll_task = None
     
     def _on_disconnected(self, client):
         """Called by Bleak when the BLE connection drops unexpectedly."""
         _LOGGER.warning("WalkingPad disconnected unexpectedly, scheduling retry")
+        self.hass.loop.create_task(self._cancel_p1_poll())
         self.client = None
         if not self._retry_task or self._retry_task.done():
             self._retry_task = self.hass.loop.create_task(self._retry_loop())
@@ -268,169 +287,259 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
     # P1 packet parsing
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _p1_bytes_to_int(data: bytearray, start: int, width: int = 3) -> int:
+        """Convert big-endian multi-byte value to int.
+
+        The P1 uses big-endian encoding for multi-byte fields
+        (time, distance, steps).
+        """
+        return int.from_bytes(data[start:start + width], byteorder="big")
+
     def _parse_p1_packet(self, data: bytearray) -> dict | None:
         """Parse a WalkingPad P1 proprietary 20-byte notification packet.
 
-        Packet structure (20 bytes, little-endian where applicable):
-          byte 0: 0xF8  — frame sync
-          byte 1: 0xA2  — data packet type
-          byte 2: speed × 0.1 km/h
-          byte 3: elapsed seconds (low byte)
-          byte 4: distance in meters
-          byte 5: 0x01  — constant
-          byte 6-7: reserved / padding
-          byte 8:  energy (calories)
-          byte 9:  distance high byte (continuation)
-          byte 10: energy high byte (continuation)
-          byte 11: exercise flag (0x00=idle, 0x01=active)
-          byte 12-13: elapsed time in seconds (little-endian uint16)
-          byte 14-17: reserved
-          byte 18: checksum (two's complement of sum of bytes 0-17)
-          byte 19: 0xFD  — frame end
+        Packet structure (20 bytes):
+          byte 0:  0xF8         — frame sync
+          byte 1:  0xA2         — response type
+          byte 2:  belt_state   — 0x05=idle, 0x02=running, 0x09=countdown, etc.
+          byte 3:  speed        — current belt speed × 10 (e.g. 15 = 1.5 km/h)
+          byte 4:  mode         — 0=Auto, 1=Manual
+          bytes 5-7:  time      — elapsed time in seconds (big-endian 3 bytes)
+          bytes 8-10: distance  — distance in 10m units (big-endian 3 bytes)
+          bytes 11-13: steps    — step count (big-endian 3 bytes)
+          byte 14:  app_speed   — last set speed × 10
+          byte 15:  unknown     — purpose unknown
+          byte 16:  button      — last controller button pressed
+          byte 17:  padding     — 0x00
+          byte 18:  checksum    — sum(data[1:18]) % 256
+          byte 19:  0xFD        — end marker
+
+        Reference: ph4-walkingpad (https://github.com/ph4r05/ph4-walkingpad)
         """
         if len(data) < P1_PKT_SIZE:
             return None
 
-        # Validate frame
+        # Validate frame markers
         if data[0] != P1_FRAME_SYNC:
             return None
-        if data[19] != 0xFD:
+        if data[19] != P1_END_MARKER:
+            return None
+        if data[1] != P1_PKT_TYPE_DATA:
             return None
 
-        # Verify checksum (two's complement of sum of bytes 0-17)
-        pkt_sum = sum(data[0:18])
-        expected_checksum = (-pkt_sum) & 0xFF
-        if data[18] != expected_checksum:
+        # Verify checksum: sum of bytes 1..17 modulo 256
+        pkt_sum = sum(data[1:18])
+        if data[18] != (pkt_sum & 0xFF):
             _LOGGER.debug(
                 "P1 packet checksum mismatch: got 0x%02X, expected 0x%02X",
-                data[18], expected_checksum,
+                data[18], pkt_sum & 0xFF,
             )
             return None
 
-        speed_raw = data[2] / 10.0
-        distance = data[4]
-        energy = data[8]
-        elapsed = int.from_bytes(data[12:14], byteorder="little")
-        exercise_flag = data[11]
+        belt_state = data[2]
+        speed_raw = data[3] / 10.0
+        elapsed = self._p1_bytes_to_int(data, 5, 3)  # seconds (BE 3 bytes)
+        distance = self._p1_bytes_to_int(data, 8, 3) * 10  # convert to meters
+        steps = self._p1_bytes_to_int(data, 11, 3)
 
-        # Derive training status from exercise flag
-        # 0x01 = active/running, 0x00 = idle/stopped
-        if exercise_flag == 0x01:
+        # Derive training status from belt_state
+        if belt_state == P1_STATE_RUNNING:
             training_status = "playing"
-        else:
+        elif belt_state in (P1_STATE_IDLE, P1_STATE_TRANSITION):
             training_status = "idle"
+        else:
+            # Countdown states (0x07-0x09) → transitional
+            training_status = "paused"
 
         return {
             "speed": round(speed_raw, 1),
             "distance": distance,
-            "energy": energy,
+            "steps": steps,
             "elapsed_time": elapsed,
+            "energy": 0,  # P1 does not report energy in notifications
             "training_status": training_status,
-            "training_status_raw": training_status,
+            "training_status_raw": belt_state,
         }
 
     def _is_p1_data_packet(self, data: bytearray) -> bool:
-        """Quick check whether this is a P1 data packet."""
+        """Quick check whether this is a P1 data packet (type 0xA2)."""
         return (
             len(data) >= P1_PKT_SIZE
             and data[0] == P1_FRAME_SYNC
             and data[1] == P1_PKT_TYPE_DATA
         )
 
-    async def _send_p1_command(self, command_byte: int, extra_bytes: bytes = b"") -> None:
-        """Send a proprietary P1 control command.
+    def _is_p1_info_packet(self, data: bytearray) -> bool:
+        """Check if this is a P1 device info packet (type 0xA5)."""
+        return (
+            len(data) >= 20
+            and data[0] == P1_FRAME_SYNC
+            and data[1] == 0xA5
+        )
 
-        Constructs a P1-style control packet and writes it to the
-        data characteristic (0000fe01).  The packet format mirrors
-        the data packet structure but uses a control-oriented
-        command byte in position 2.
+    async def _send_p1_command(self, cmd_byte: int, payload: int = 0x00) -> None:
+        """Send a proprietary P1 control command to 0000fe02.
 
-        Args:
-            command_byte:  Command identifier (e.g. start, stop, speed).
-            extra_bytes:   Additional payload bytes (e.g. speed value).
+        Command packet format (6 bytes):
+          byte 0:  0xF7           — command sync
+          byte 1:  0xA2           — command type
+          byte 2:  command byte   — e.g. 0x04=start, 0x01=speed, 0x02=mode
+          byte 3:  payload        — e.g. speed x10, mode value, 0x01 for start
+          byte 4:  checksum       — sum(bytes[1:4]) % 256
+          byte 5:  0xFD           — end marker
+
+        Reference: ph4-walkingpad (https://github.com/ph4r05/ph4-walkingpad)
         """
         if not self.is_connected or not self.client:
             _LOGGER.debug("Cannot send P1 command: not connected")
             return
         try:
-            # Build control packet
-            #   byte 0:  0xF8  — sync
-            #   byte 1:  0xA2  — packet type (same as data, P1 uses single char)
-            #   byte 2:  command
-            #   bytes 3-17: payload / zeroed
-            #   byte 18: checksum
-            #   byte 19: 0xFD  — frame end
-            pkt = bytearray(P1_PKT_SIZE)
-            pkt[0] = P1_FRAME_SYNC
-            pkt[1] = P1_PKT_TYPE_DATA
-            pkt[2] = command_byte
-            # Copy extra bytes into the payload area
-            for i, b in enumerate(extra_bytes):
-                if i + 3 < P1_PKT_SIZE - 1:
-                    pkt[3 + i] = b
-            # Calculate checksum: two's complement of sum of bytes 0-17
-            pkt_sum = sum(pkt[0:18])
-            pkt[18] = (-pkt_sum) & 0xFF
-            pkt[19] = 0xFD
+            pkt = bytearray([
+                P1_CMD_SYNC,              # 0xF7
+                P1_CMD_TYPE,              # 0xA2
+                cmd_byte,
+                payload,
+                0x00,                     # placeholder for checksum
+                P1_END_MARKER,            # 0xFD
+            ])
+            # Calculate checksum: sum(bytes[1:4]) % 256, placed at byte 4
+            pkt[4] = sum(pkt[1:4]) & 0xFF
 
             await self.client.write_gatt_char(
                 self.uuids["control"],
                 bytes(pkt),
                 response=True,
             )
-            _LOGGER.debug("P1 command sent: 0x%02X %s", command_byte, " ".join(f"{b:02X}" for b in extra_bytes))
+            _LOGGER.debug(
+                "P1 command sent: %s",
+                " ".join(f"{b:02X}" for b in pkt),
+            )
         except Exception as exc:
             _LOGGER.warning("Failed to send P1 command: %s", exc)
 
     async def _send_p1_set_speed(self, kmh: float) -> None:
-        """Send a P1 speed control command.
+        """Set P1 belt speed.
 
-        Speed is encoded as an integer in bytes 3-4 (little-endian,
-        representing speed × 100, i.e. 6.0 km/h → 600 → 0x02 0x58).
+        Sends: F7 A2 01 <speedx10> <chk> FD
+        Speed is encoded as speed x 10 (e.g. 6.0 km/h -> 60 -> 0x3C).
         """
-        speed_val = int(round(kmh * 100))
-        speed_bytes = speed_val.to_bytes(2, byteorder="little")
-        await self._send_p1_command(0x06, speed_bytes)  # 0x06 = set speed for P1
+        speed_val = int(round(max(self.speed_min, min(self.speed_max, kmh)) * 10))
+        await self._send_p1_command(P1_CMD_SPEED, speed_val)
 
     async def _send_p1_start(self) -> None:
-        """Send a P1 start/resume command."""
-        await self._send_p1_command(0x07)  # 0x07 = start/resume for P1
+        """Start the P1 belt in Manual mode.
+
+        Two-step procedure:
+          1. Switch to Manual mode: F7 A2 02 01 <chk> FD
+          2. Start belt:            F7 A2 04 01 <chk> FD
+
+        Reference: ph4-walkingpad start_belt(manual=True)
+        """
+        # Step 1: switch to Manual mode
+        await self._send_p1_command(P1_CMD_MODE, 0x01)  # 0x01 = Manual mode
+        await asyncio.sleep(1.5)
+        # Step 2: start belt
+        await self._send_p1_command(P1_CMD_START, 0x01)
 
     async def _send_p1_stop(self) -> None:
-        """Send a P1 stop command."""
-        await self._send_p1_command(0x08, bytes([0x01]))  # 0x01 = stop
+        """Stop the P1 belt by setting speed to 0.
+
+        Sends: F7 A2 01 00 <chk> FD  (set speed = 0)
+        Reference: ph4-walkingpad stop_belt()
+        """
+        await self._send_p1_command(P1_CMD_SPEED, 0x00)
 
     async def _send_p1_pause(self) -> None:
-        """Send a P1 pause command."""
-        await self._send_p1_command(0x08, bytes([0x02]))  # 0x02 = pause
+        """Pause the P1 belt by setting speed to 0 (same as stop)."""
+        await self._send_p1_command(P1_CMD_SPEED, 0x00)
+
+    # ------------------------------------------------------------------
+    # P1 periodic status polling
+    # ------------------------------------------------------------------
+
+    async def _send_p1_query(self) -> None:
+        """Query P1 belt status.
+
+        Sends: F7 A2 00 00 <chk> FD
+        The belt responds with a 0xF8 0xA2 status notification on 0000fe01.
+        Reference: ph4-walkingpad ask_stats()
+        """
+        if not self.is_connected or not self.client:
+            return
+        try:
+            pkt = bytearray([
+                P1_CMD_SYNC,         # 0xF7
+                P1_CMD_TYPE,         # 0xA2
+                P1_CMD_QUERY,        # 0x00
+                0x00,                # padding
+                0x00,                # placeholder for checksum
+                P1_END_MARKER,       # 0xFD
+            ])
+            pkt[4] = sum(pkt[1:4]) & 0xFF
+            await self.client.write_gatt_char(
+                self.uuids["control"],
+                bytes(pkt),
+                response=True,
+            )
+        except Exception as exc:
+            _LOGGER.debug("P1 query failed: %s", exc)
+
+    async def _p1_poll_loop(self) -> None:
+        """Background task: poll P1 for status at ~750ms intervals.
+
+        The P1 only sends notifications on 0000fe01 when explicitly
+        queried via the command characteristic.  This mirrors the
+        ph4-walkingpad Controller.stats_fetcher() behaviour.
+        """
+        try:
+            while self.is_connected:
+                await self._send_p1_query()
+                await asyncio.sleep(0.75)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            _LOGGER.debug("P1 poll loop ended: %s", exc)
 
     def _notification_handler(self, sender, data: bytearray):
         """Parse treadmill data notifications."""
         _LOGGER.debug("Received treadmill data notification")
 
         # --- WalkingPad P1: proprietary 20-byte packet format ---
-        if self.is_p1 and self._is_p1_data_packet(data):
-            parsed = self._parse_p1_packet(data)
-            if parsed is None:
-                _LOGGER.debug("P1 packet parse failed, skipping")
-                return
-            prev_status = self.data.get("training_status")
-            self.data.update(parsed)
-            new_status = self.data["training_status"]
+        if self.is_p1:
+            if self._is_p1_data_packet(data):
+                parsed = self._parse_p1_packet(data)
+                if parsed is None:
+                    _LOGGER.debug("P1 packet parse failed, skipping")
+                    return
+                prev_status = self.data.get("training_status")
+                self.data.update(parsed)
+                new_status = self.data["training_status"]
 
-            # Watch session lifecycle — same logic as _training_status_handler
-            if self.use_watch:
-                if new_status == "playing" and prev_status != "playing":
-                    self.start_watch_session()
-                elif new_status == "idle" and prev_status not in ("idle", "unknown"):
-                    self.reset_watch_session()
-                self.update_watch_data()
+                # Watch session lifecycle — same logic as _training_status_handler
+                if self.use_watch:
+                    if new_status == "playing" and prev_status != "playing":
+                        self.start_watch_session()
+                    elif new_status == "idle" and prev_status not in ("idle", "unknown"):
+                        self.reset_watch_session()
+                    self.update_watch_data()
 
-            try:
-                self.async_set_updated_data(self.data)
-            except Exception:
+                try:
+                    self.async_set_updated_data(self.data)
+                except Exception:
+                    return
                 return
-            return
+            elif self._is_p1_info_packet(data):
+                # Device info packet (0xA5) — contains model identifier
+                # Can be used to confirm P1 detection, skip processing
+                _LOGGER.debug("P1 device info packet received (type 0xA5)")
+                return
+            else:
+                # Unknown P1 packet type (e.g. 0xA6, 0xA7) — skip
+                _LOGGER.debug(
+                    "Unknown P1 packet type 0x%02X, skipping", data[1] if len(data) > 1 else 0
+                )
+                return
 
         try:
             speed_raw = int.from_bytes(data[2:4], byteorder="little") / 100

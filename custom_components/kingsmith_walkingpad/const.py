@@ -55,9 +55,28 @@ MODEL_UUIDS = {
 
 # WalkingPad P1 proprietary packet constants
 # 20-byte notification format on characteristic 0000fe01
-P1_FRAME_SYNC   = 0xF8
-P1_PKT_TYPE_DATA = 0xA2
-P1_PKT_SIZE     = 20
+P1_FRAME_SYNC     = 0xF8   # Response/notification sync byte
+P1_PKT_TYPE_DATA  = 0xA2   # Response packet type identifier
+P1_PKT_SIZE       = 20     # Packet size (20 bytes)
+P1_END_MARKER     = 0xFD   # End-of-packet marker
+
+# P1 command protocol (written to 0000fe02)
+P1_CMD_SYNC       = 0xF7   # Command sync byte (different from response!)
+P1_CMD_TYPE       = 0xA2   # Command type identifier
+
+# P1 command bytes (2nd byte of payload, after 0xF7 0xA2)
+P1_CMD_QUERY      = 0x00   # Query belt status
+P1_CMD_SPEED      = 0x01   # Set speed (payload = speed × 10)
+P1_CMD_MODE       = 0x02   # Switch mode (payload: 0=Auto, 1=Manual, 2=Standby)
+P1_CMD_START      = 0x04   # Start belt (payload = 0x01)
+
+# P1 belt state values (byte 2 of response)
+P1_STATE_IDLE     = 0x05   # Belt idle/standby
+P1_STATE_RUNNING  = 0x02   # Belt running
+P1_STATE_COUNTDOWN = 0x09  # Countdown 3
+P1_STATE_COUNTDOWN2 = 0x08 # Countdown 2
+P1_STATE_COUNTDOWN1 = 0x07 # Countdown 1
+P1_STATE_TRANSITION = 0x00 # Transitional (starting/stopping)
 
 
 # Components
