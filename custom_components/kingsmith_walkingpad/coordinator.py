@@ -168,17 +168,21 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         # KS Fit staggers 100/200/300ms between subscriptions; we mirror this.
         # Reference: walkingpad-controller docs/ftms-protocol-reference.md §2.2
         #
-        # For P1, all three UUIDs are the same characteristic (0000fe01).
-        # bleak's start_notify replaces the callback, so we use a unified
-        # handler that routes P1 packets to the appropriate logic.
+        # For P1: data on 0000fe01 (N+R), control on 0000fe02 (W+N+R)
         if self.is_p1:
-            try:
-                await self.client.start_notify(
-                    self.uuids["data"], self._p1_unified_handler
-                )
-                _LOGGER.info("Subscribed to P1 data/control notifications")
-            except Exception as exc:
-                _LOGGER.error("Failed to subscribe to P1 notifications: %s", exc)
+            subscriptions = [
+                (self.uuids["data"],    self._notification_handler,      "P1 Data",         0.10),
+                (self.uuids["control"], self.handle_response,            "P1 Control",      0.20),
+            ]
+            for uuid, handler, label, delay in subscriptions:
+                try:
+                    await self.client.start_notify(uuid, handler)
+                    _LOGGER.debug("Subscribed to %s", label)
+                except Exception as exc:
+                    _LOGGER.error("Failed to subscribe to %s: %s", label, exc)
+                if delay:
+                    await asyncio.sleep(delay)
+            _LOGGER.info("Subscribed to P1 notifications")
         else:
             subscriptions = [
                 (self.uuids["data"],    self._notification_handler,      "Treadmill Data",    0.10),
@@ -377,45 +381,6 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("P1 command sent: 0x%02X %s", command_byte, " ".join(f"{b:02X}" for b in extra_bytes))
         except Exception as exc:
             _LOGGER.warning("Failed to send P1 command: %s", exc)
-
-    # ------------------------------------------------------------------
-    # P1 unified notification handler
-    # ------------------------------------------------------------------
-
-    def _p1_unified_handler(self, sender, data: bytearray):
-        """Unified handler for all P1 notifications.
-
-        Since P1 uses a single characteristic (0000fe01) for data,
-        status, and control, we need one handler that processes all
-        incoming packets.
-        """
-        if not self._is_p1_data_packet(data):
-            # Not a P1 data packet — log for debugging
-            hex_data = " ".join(f"{b:02X}" for b in data)
-            _LOGGER.debug("P1 non-data packet received: %s (%d bytes)", hex_data, len(data))
-            return
-
-        parsed = self._parse_p1_packet(data)
-        if parsed is None:
-            _LOGGER.debug("P1 packet parse failed, skipping")
-            return
-
-        prev_status = self.data.get("training_status")
-        self.data.update(parsed)
-        new_status = self.data["training_status"]
-
-        # Watch session lifecycle
-        if self.use_watch:
-            if new_status == "playing" and prev_status != "playing":
-                self.start_watch_session()
-            elif new_status == "idle" and prev_status not in ("idle", "unknown"):
-                self.reset_watch_session()
-            self.update_watch_data()
-
-        try:
-            self.async_set_updated_data(self.data)
-        except Exception:
-            pass
 
     async def _send_p1_set_speed(self, kmh: float) -> None:
         """Send a P1 speed control command.
