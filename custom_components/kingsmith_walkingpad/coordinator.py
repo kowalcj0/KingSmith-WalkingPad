@@ -73,6 +73,10 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         self.client = None
         self._retry_task = None
         self._p1_poll_task = None
+        # P1 energy estimation — tracks last distance for incremental calculation
+        self._p1_last_distance: int = 0
+        # Weight entity from config (used for P1 energy estimation)
+        self._weight_entity: str | None = config.get(CONF_WEIGHT_ENTITY)
         self.data = {
             "speed": 0.0,
             "distance": 0,
@@ -357,7 +361,6 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             "distance": distance,
             "steps": steps,
             "elapsed_time": elapsed,
-            "energy": 0,  # P1 does not report energy in notifications
             "training_status": training_status,
             "training_status_raw": belt_state,
         }
@@ -455,6 +458,53 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         await self._send_p1_command(P1_CMD_SPEED, 0x00)
 
     # ------------------------------------------------------------------
+    # P1 energy estimation
+    # ------------------------------------------------------------------
+
+    def _get_weight_kg(self) -> float:
+        """Read the user's weight from the configured weight entity.
+
+        Falls back to 75 kg when no entity is configured or unavailable.
+        Weight is stored as a HA sensor state (e.g. "75.0" or "75 kg").
+        """
+        if not self._weight_entity:
+            return 75.0
+        state = self.hass.states.get(self._weight_entity)
+        if not state or state.state in (None, "unknown", "unavailable"):
+            return 75.0
+        try:
+            return float(str(state.state).replace("kg", "").strip())
+        except (ValueError, TypeError):
+            return 75.0
+
+    def _update_p1_energy(self, distance_m: int, speed_kmh: float) -> None:
+        """Incrementally update energy estimate for P1 from distance delta.
+
+        The P1 does not report energy in its notifications.  We estimate it
+        from the distance travelled and the user's weight using a standard
+        MET-based formula for walking:
+          kcal ≈ distance(km) × weight(kg) × 0.35
+
+        This is the same approach used by the ph4-walkingpad reference
+        implementation (calories_walk2_minute).
+        """
+        if speed_kmh <= 0:
+            # Belt stopped — do not accumulate energy
+            self._p1_last_distance = distance_m
+            return
+
+        delta_m = distance_m - self._p1_last_distance
+        self._p1_last_distance = distance_m
+
+        if delta_m <= 0:
+            return
+
+        weight = self._get_weight_kg()
+        # ~0.35 kcal per kg per km for level walking at 0.5-6.0 km/h
+        kcal = delta_m / 1000.0 * weight * 0.35
+        self.data["energy"] = self.data.get("energy", 0) + round(kcal, 1)
+
+    # ------------------------------------------------------------------
     # P1 periodic status polling
     # ------------------------------------------------------------------
 
@@ -513,8 +563,16 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("P1 packet parse failed, skipping")
                     return
                 prev_status = self.data.get("training_status")
+
+                # Calculate energy from distance delta before updating data
+                self._update_p1_energy(parsed["distance"], parsed["speed"])
+
                 self.data.update(parsed)
                 new_status = self.data["training_status"]
+
+                # Reset distance tracking when belt stops
+                if new_status == "idle" and prev_status not in ("idle", "unknown"):
+                    self._p1_last_distance = 0
 
                 # Watch session lifecycle — same logic as _training_status_handler
                 if self.use_watch:
