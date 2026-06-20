@@ -41,7 +41,7 @@ MODEL_UUIDS = {
         "control": "0000fe02-0000-1000-8000-00805f9b34fb",
         "status": "0000fe01-0000-1000-8000-00805f9b34fb",
         "speed_min": 0.5,
-        "speed_max": 12.0,
+        "speed_max": 6.0,
     },
     # Fallback for unknown / future models
     "WalkingPad": {
@@ -111,7 +111,7 @@ CMD_MC21_AUTH  = bytes([0x01, 0x00, 0x0D, 0x00, 0x06, 0x0B, 0x0F, 0x0D])
 
 # Speed control
 SPEED_MIN = 1.0   # km/h
-SPEED_MAX = 12.0  # km/h
+SPEED_MAX = 6.0  # km/h
 SPEED_STEP = 0.1  # km/h resolution the treadmill accepts
 
 def cmd_set_speed(kmh: float) -> bytes:
