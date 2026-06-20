@@ -25,7 +25,7 @@ class WalkingPadSpeedNumber(NumberEntity):
     _attr_icon = "mdi:speedometer"
     _attr_native_step = SPEED_STEP
     _attr_native_unit_of_measurement = "km/h"
-    _attr_mode = NumberMode.SLIDER   # renders as a slider with the actual km/h values shown
+    _attr_mode = NumberMode.AUTO     # compact input rather than a large slider
 
     def __init__(self, coordinator):
         self.coordinator = coordinator
