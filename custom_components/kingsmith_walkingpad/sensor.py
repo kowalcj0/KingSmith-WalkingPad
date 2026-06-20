@@ -103,11 +103,12 @@ class WalkingPadBmiSensor(SensorEntity):
     async def async_added_to_hass(self):
         """Register for updates from both treadmill and weight sensor."""
         self.coordinator.async_add_listener(self._handle_coordinator_update)
-        async_track_state_change_event(
-            self.hass,
-            [self.weight_entity_id],
-            self._handle_weight_update
-        )
+        if self.weight_entity_id:
+            async_track_state_change_event(
+                self.hass,
+                [self.weight_entity_id],
+                self._handle_weight_update
+            )
         self._recalculate_bmi()
         self.async_write_ha_state()
 

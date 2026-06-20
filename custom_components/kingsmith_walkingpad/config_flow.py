@@ -22,6 +22,10 @@ SUPPORTED_NAME_PREFIXES = (
     "WalkingPad"
 )
 
+# Known GATT model number strings that identify specific P1 variants
+# These come from the Device Information service (0x2A24) characteristic
+P1_MODEL_NUMBERS = ("WLT8266M",)  # WalkingPad P1 / M30 platform
+
 def normalize_model(ble_name: str) -> str:
     """Normalize BLE name into a stable WalkingPad model string.
     Order matters — more specific prefixes must come before generic ones.

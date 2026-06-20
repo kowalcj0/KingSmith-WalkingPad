@@ -31,6 +31,9 @@ from .const import (
     CMD_MC21_STOP,
     UUID_MC21_AUTH,
     CMD_MC21_AUTH,
+    P1_FRAME_SYNC,
+    P1_PKT_TYPE_DATA,
+    P1_PKT_SIZE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,6 +56,9 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
                 raise ValueError(
                     f"Missing UUID '{key}' for model '{self.model}'"
                 )
+
+        # Known GATT model number strings for P1 detection
+        self._p1_model_numbers = ("WLT8266M",)
 
         self.client = None
         self._retry_task = None
@@ -156,20 +162,36 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         # CCCD writes that arrive within ~30ms of each other.
         # KS Fit staggers 100/200/300ms between subscriptions; we mirror this.
         # Reference: walkingpad-controller docs/ftms-protocol-reference.md §2.2
-        subscriptions = [
-            (self.uuids["data"],    self._notification_handler,      "Treadmill Data",    0.10),
-            (self.uuids["status"],  self._training_status_handler,   "Machine Status",    0.20),
-            (self.uuids["control"], self.handle_response,            "Control Point",     0.0),
-        ]
-        for uuid, handler, label, delay in subscriptions:
+        #
+        # For P1, all three UUIDs are the same characteristic (0000fe01).
+        # bleak's start_notify replaces the callback, so we use a unified
+        # handler that routes P1 packets to the appropriate logic.
+        if self.is_p1:
             try:
-                await self.client.start_notify(uuid, handler)
-                _LOGGER.debug("Subscribed to %s", label)
+                await self.client.start_notify(
+                    self.uuids["data"], self._p1_unified_handler
+                )
+                _LOGGER.info("Subscribed to P1 data/control notifications")
             except Exception as exc:
-                _LOGGER.error("Failed to subscribe to %s: %s", label, exc)
-            if delay:
-                await asyncio.sleep(delay)
-        _LOGGER.info("Subscribed to all notifications")
+                _LOGGER.error("Failed to subscribe to P1 notifications: %s", exc)
+        else:
+            subscriptions = [
+                (self.uuids["data"],    self._notification_handler,      "Treadmill Data",    0.10),
+                (self.uuids["status"],  self._training_status_handler,   "Machine Status",    0.20),
+                (self.uuids["control"], self.handle_response,            "Control Point",     0.0),
+            ]
+            for uuid, handler, label, delay in subscriptions:
+                try:
+                    await self.client.start_notify(uuid, handler)
+                    _LOGGER.debug("Subscribed to %s", label)
+                except Exception as exc:
+                    _LOGGER.error("Failed to subscribe to %s: %s", label, exc)
+                if delay:
+                    await asyncio.sleep(delay)
+            _LOGGER.info("Subscribed to all notifications")
+
+        # Try to detect P1 model from GATT model number characteristic
+        await self._detect_p1_model()
 
         # MC21: send initial ODM pre-amble once at connect (mirrors KS Fit behaviour)
         # This is also sent before each command in send_start/pause/finish/set_speed
@@ -202,9 +224,247 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         if not self._retry_task or self._retry_task.done():
             self._retry_task = self.hass.loop.create_task(self._retry_loop())
 
+    # ------------------------------------------------------------------
+    # P1 model detection
+    # ------------------------------------------------------------------
+
+    @property
+    def is_p1(self) -> bool:
+        """True for WalkingPad P1 — proprietary protocol."""
+        return self.model == "WalkingPad P1"
+
+    async def _detect_p1_model(self) -> None:
+        """Read the GATT Model Number String (0x2A24) to detect P1 variant.
+
+        The P1 (WLT8266M / M30 platform) does not advertise a distinctive
+        BLE name — it just says "WalkingPad", the same as the generic
+        fallback model.  We read the Device Information service model
+        number characteristic to distinguish it.
+        """
+        if not self.is_connected:
+            return
+        try:
+            model_bytes = await self.client.read_gatt_char("00002a24-0000-1000-8000-00805f9b34fb")
+            model_str = model_bytes.strip(b"\x00").decode("utf-8", errors="replace").strip()
+            if model_str in self._p1_model_numbers:
+                _LOGGER.info(
+                    "Detected WalkingPad P1 via GATT model number: %s",
+                    model_str,
+                )
+                self.model = "WalkingPad P1"
+                self.uuids = MODEL_UUIDS["WalkingPad P1"]
+                self.speed_min = self.uuids.get("speed_min", SPEED_MIN)
+                self.speed_max = self.uuids.get("speed_max", SPEED_MAX)
+        except Exception as exc:
+            _LOGGER.debug("Could not read GATT model number: %s", exc)
+
+    # ------------------------------------------------------------------
+    # P1 packet parsing
+    # ------------------------------------------------------------------
+
+    def _parse_p1_packet(self, data: bytearray) -> dict | None:
+        """Parse a WalkingPad P1 proprietary 20-byte notification packet.
+
+        Packet structure (20 bytes, little-endian where applicable):
+          byte 0: 0xF8  — frame sync
+          byte 1: 0xA2  — data packet type
+          byte 2: speed × 0.1 km/h
+          byte 3: elapsed seconds (low byte)
+          byte 4: distance in meters
+          byte 5: 0x01  — constant
+          byte 6-7: reserved / padding
+          byte 8:  energy (calories)
+          byte 9:  distance high byte (continuation)
+          byte 10: energy high byte (continuation)
+          byte 11: exercise flag (0x00=idle, 0x01=active)
+          byte 12-13: elapsed time in seconds (little-endian uint16)
+          byte 14-17: reserved
+          byte 18: checksum (two's complement of sum of bytes 0-17)
+          byte 19: 0xFD  — frame end
+        """
+        if len(data) < P1_PKT_SIZE:
+            return None
+
+        # Validate frame
+        if data[0] != P1_FRAME_SYNC:
+            return None
+        if data[19] != 0xFD:
+            return None
+
+        # Verify checksum (two's complement of sum of bytes 0-17)
+        pkt_sum = sum(data[0:18])
+        expected_checksum = (-pkt_sum) & 0xFF
+        if data[18] != expected_checksum:
+            _LOGGER.debug(
+                "P1 packet checksum mismatch: got 0x%02X, expected 0x%02X",
+                data[18], expected_checksum,
+            )
+            return None
+
+        speed_raw = data[2] / 10.0
+        distance = data[4]
+        energy = data[8]
+        elapsed = int.from_bytes(data[12:14], byteorder="little")
+        exercise_flag = data[11]
+
+        # Derive training status from exercise flag
+        # 0x01 = active/running, 0x00 = idle/stopped
+        if exercise_flag == 0x01:
+            training_status = "playing"
+        else:
+            training_status = "idle"
+
+        return {
+            "speed": round(speed_raw, 1),
+            "distance": distance,
+            "energy": energy,
+            "elapsed_time": elapsed,
+            "training_status": training_status,
+            "training_status_raw": training_status,
+        }
+
+    def _is_p1_data_packet(self, data: bytearray) -> bool:
+        """Quick check whether this is a P1 data packet."""
+        return (
+            len(data) >= P1_PKT_SIZE
+            and data[0] == P1_FRAME_SYNC
+            and data[1] == P1_PKT_TYPE_DATA
+        )
+
+    async def _send_p1_command(self, command_byte: int, extra_bytes: bytes = b"") -> None:
+        """Send a proprietary P1 control command.
+
+        Constructs a P1-style control packet and writes it to the
+        data characteristic (0000fe01).  The packet format mirrors
+        the data packet structure but uses a control-oriented
+        command byte in position 2.
+
+        Args:
+            command_byte:  Command identifier (e.g. start, stop, speed).
+            extra_bytes:   Additional payload bytes (e.g. speed value).
+        """
+        if not self.is_connected or not self.client:
+            _LOGGER.debug("Cannot send P1 command: not connected")
+            return
+        try:
+            # Build control packet
+            #   byte 0:  0xF8  — sync
+            #   byte 1:  0xA2  — packet type (same as data, P1 uses single char)
+            #   byte 2:  command
+            #   bytes 3-17: payload / zeroed
+            #   byte 18: checksum
+            #   byte 19: 0xFD  — frame end
+            pkt = bytearray(P1_PKT_SIZE)
+            pkt[0] = P1_FRAME_SYNC
+            pkt[1] = P1_PKT_TYPE_DATA
+            pkt[2] = command_byte
+            # Copy extra bytes into the payload area
+            for i, b in enumerate(extra_bytes):
+                if i + 3 < P1_PKT_SIZE - 1:
+                    pkt[3 + i] = b
+            # Calculate checksum: two's complement of sum of bytes 0-17
+            pkt_sum = sum(pkt[0:18])
+            pkt[18] = (-pkt_sum) & 0xFF
+            pkt[19] = 0xFD
+
+            await self.client.write_gatt_char(
+                self.uuids["control"],
+                bytes(pkt),
+                response=True,
+            )
+            _LOGGER.debug("P1 command sent: 0x%02X %s", command_byte, " ".join(f"{b:02X}" for b in extra_bytes))
+        except Exception as exc:
+            _LOGGER.warning("Failed to send P1 command: %s", exc)
+
+    # ------------------------------------------------------------------
+    # P1 unified notification handler
+    # ------------------------------------------------------------------
+
+    def _p1_unified_handler(self, sender, data: bytearray):
+        """Unified handler for all P1 notifications.
+
+        Since P1 uses a single characteristic (0000fe01) for data,
+        status, and control, we need one handler that processes all
+        incoming packets.
+        """
+        if not self._is_p1_data_packet(data):
+            # Not a P1 data packet — log for debugging
+            hex_data = " ".join(f"{b:02X}" for b in data)
+            _LOGGER.debug("P1 non-data packet received: %s (%d bytes)", hex_data, len(data))
+            return
+
+        parsed = self._parse_p1_packet(data)
+        if parsed is None:
+            _LOGGER.debug("P1 packet parse failed, skipping")
+            return
+
+        prev_status = self.data.get("training_status")
+        self.data.update(parsed)
+        new_status = self.data["training_status"]
+
+        # Watch session lifecycle
+        if self.use_watch:
+            if new_status == "playing" and prev_status != "playing":
+                self.start_watch_session()
+            elif new_status == "idle" and prev_status not in ("idle", "unknown"):
+                self.reset_watch_session()
+            self.update_watch_data()
+
+        try:
+            self.async_set_updated_data(self.data)
+        except Exception:
+            pass
+
+    async def _send_p1_set_speed(self, kmh: float) -> None:
+        """Send a P1 speed control command.
+
+        Speed is encoded as an integer in bytes 3-4 (little-endian,
+        representing speed × 100, i.e. 6.0 km/h → 600 → 0x02 0x58).
+        """
+        speed_val = int(round(kmh * 100))
+        speed_bytes = speed_val.to_bytes(2, byteorder="little")
+        await self._send_p1_command(0x06, speed_bytes)  # 0x06 = set speed for P1
+
+    async def _send_p1_start(self) -> None:
+        """Send a P1 start/resume command."""
+        await self._send_p1_command(0x07)  # 0x07 = start/resume for P1
+
+    async def _send_p1_stop(self) -> None:
+        """Send a P1 stop command."""
+        await self._send_p1_command(0x08, bytes([0x01]))  # 0x01 = stop
+
+    async def _send_p1_pause(self) -> None:
+        """Send a P1 pause command."""
+        await self._send_p1_command(0x08, bytes([0x02]))  # 0x02 = pause
+
     def _notification_handler(self, sender, data: bytearray):
         """Parse treadmill data notifications."""
         _LOGGER.debug("Received treadmill data notification")
+
+        # --- WalkingPad P1: proprietary 20-byte packet format ---
+        if self.is_p1 and self._is_p1_data_packet(data):
+            parsed = self._parse_p1_packet(data)
+            if parsed is None:
+                _LOGGER.debug("P1 packet parse failed, skipping")
+                return
+            prev_status = self.data.get("training_status")
+            self.data.update(parsed)
+            new_status = self.data["training_status"]
+
+            # Watch session lifecycle — same logic as _training_status_handler
+            if self.use_watch:
+                if new_status == "playing" and prev_status != "playing":
+                    self.start_watch_session()
+                elif new_status == "idle" and prev_status not in ("idle", "unknown"):
+                    self.reset_watch_session()
+                self.update_watch_data()
+
+            try:
+                self.async_set_updated_data(self.data)
+            except Exception:
+                return
+            return
+
         try:
             speed_raw = int.from_bytes(data[2:4], byteorder="little") / 100
 
@@ -288,11 +548,15 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
 
     async def send_start(self):
         """Start the treadmill.
+        P1:   Send proprietary start command via 0000fe01
         MC21: ODM preamble → Request Control (tolerate rejection) → START_OR_RESUME [0x07]
         MC11: Request Control → START_OR_RESUME [0x07, 0x01]
         """
         if not self.is_connected:
             _LOGGER.debug("Cannot send START, client not connected")
+            return
+        if self.is_p1:
+            await self._send_p1_start()
             return
         # MC21: send ODM preamble before each command (KS Fit does this every time)
         if self.is_mc21:
@@ -307,11 +571,15 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
 
     async def send_pause(self):
         """Pause the treadmill.
+        P1:   Send proprietary pause command via 0000fe01
         MC21: ODM preamble → Request Control (tolerate rejection) → STOP_OR_PAUSE [0x08, 0x02]
         MC11: Request Control → STOP_OR_PAUSE [0x08, 0x02]
         """
         if not self.is_connected:
             _LOGGER.debug("Cannot send PAUSE, client not connected")
+            return
+        if self.is_p1:
+            await self._send_p1_pause()
             return
         if self.is_mc21:
             await self.send_mc21_auth()
@@ -325,11 +593,15 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
 
     async def send_finish(self):
         """Stop the treadmill completely.
+        P1:   Send proprietary stop command via 0000fe01
         MC21: ODM preamble → Request Control (tolerate rejection) → STOP_OR_PAUSE [0x08, 0x01]
         MC11: Request Control → STOP_OR_PAUSE [0x08, 0x01]
         """
         if not self.is_connected:
             _LOGGER.debug("Cannot send FINISH, client not connected")
+            return
+        if self.is_p1:
+            await self._send_p1_stop()
             return
         if self.is_mc21:
             await self.send_mc21_auth()
@@ -352,6 +624,11 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
         if self.data.get("training_status") != "playing":
             _LOGGER.warning("Cannot set speed: treadmill is not actively playing")
             return
+        if self.is_p1:
+            # Clamp and round to 0.1 resolution
+            kmh = round(max(self.speed_min, min(self.speed_max, kmh)), 1)
+            await self._send_p1_set_speed(kmh)
+            return
         # Clamp and round to 0.1 resolution
         kmh = round(max(self.speed_min, min(self.speed_max, kmh)), 1)
         # MC21: send ODM preamble before speed command (same as start/stop)
@@ -369,7 +646,16 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Failed to set speed: %s", exc)
 
     def handle_response(self, sender, data):
-        """Parse control point responses and update state."""
+        """Parse control point responses and update state.
+
+        P1 uses the same characteristic for data and control, so P1 data
+        packets will also arrive here.  Skip them — they are handled by
+        _notification_handler.
+        """
+        # Skip P1 data packets
+        if self.is_p1 and self._is_p1_data_packet(data):
+            return
+
         _LOGGER.debug("Control point response: %s", " ".join(f"{b:02X}" for b in data))
         try:
             if len(data) >= 2 and data[0] == 0x80:
@@ -398,8 +684,13 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
 
         MC11 uses UUID 2AD3 (Training Status) with proprietary byte format.
         MC21 uses UUID 2ADA (Fitness Machine Status) with FTMS standard format.
-        Both are routed here — we detect which format based on b[0].
+        P1 uses the same characteristic as data — skip P1 data packets here
+        since they are handled exclusively by _notification_handler.
         """
+        # Skip P1 data packets — they are handled by _notification_handler
+        if self.is_p1 and self._is_p1_data_packet(data):
+            return
+
         hex_data = " ".join(f"{b:02X}" for b in data)
         _LOGGER.debug("Training Status raw data: %s", hex_data)
 

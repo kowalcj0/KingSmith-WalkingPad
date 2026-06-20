@@ -32,6 +32,16 @@ MODEL_UUIDS = {
         "speed_min": 0.5,   # confirmed from 2AD4 Supported Speed Range
         "speed_max": 10.0,  # confirmed from 2AD4 Supported Speed Range
     },
+    # WalkingPad P1 — proprietary protocol (WLT8266M / M30 platform)
+    # Uses custom 0000fe01 characteristic for all data/control.
+    # No standard FTMS/TS characteristics (2ACD, 2AD3, 2AD9, 2ADA) present.
+    "WalkingPad P1": {
+        "data": "0000fe01-0000-1000-8000-00805f9b34fb",
+        "control": "0000fe01-0000-1000-8000-00805f9b34fb",
+        "status": "0000fe01-0000-1000-8000-00805f9b34fb",
+        "speed_min": 0.5,
+        "speed_max": 12.0,
+    },
     # Fallback for unknown / future models
     "WalkingPad": {
         "data": UUID_TREADMILL_DATA,
@@ -41,6 +51,12 @@ MODEL_UUIDS = {
         "speed_max": 10.0,
     },
 }
+
+# WalkingPad P1 proprietary packet constants
+# 20-byte notification format on characteristic 0000fe01
+P1_FRAME_SYNC   = 0xF8
+P1_PKT_TYPE_DATA = 0xA2
+P1_PKT_SIZE     = 20
 
 
 # Components
