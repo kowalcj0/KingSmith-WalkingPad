@@ -158,6 +158,11 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Failed to connect to device: %s", exc)
             raise
 
+        # Detect P1 model from GATT model number BEFORE subscribing.
+        # The P1 (WLT8266M) has no FTMS characteristics; subscribing to
+        # them fails. We must know we're talking to a P1 first.
+        await self._detect_p1_model()
+
         # Subscribe with staggered delays — KingSmith firmware silently drops
         # CCCD writes that arrive within ~30ms of each other.
         # KS Fit staggers 100/200/300ms between subscriptions; we mirror this.
@@ -189,9 +194,6 @@ class WalkingPadCoordinator(DataUpdateCoordinator):
                 if delay:
                     await asyncio.sleep(delay)
             _LOGGER.info("Subscribed to all notifications")
-
-        # Try to detect P1 model from GATT model number characteristic
-        await self._detect_p1_model()
 
         # MC21: send initial ODM pre-amble once at connect (mirrors KS Fit behaviour)
         # This is also sent before each command in send_start/pause/finish/set_speed
